@@ -1,11 +1,12 @@
-#include "server-common.h"
 #include "server-task.h"
 
-#include "common.h"
-#include "llama.h"
 #include "chat.h"
-#include "sampling.h"
+#include "common.h"
 #include "json-schema-to-grammar.h"
+#include "llama.h"
+#include "sampling.h"
+#include "speculative.h"
+#include "server-common.h"
 
 using json = nlohmann::ordered_json;
 
@@ -76,6 +77,10 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.n_max",         speculative.n_max},
             {"speculative.n_min",         speculative.n_min},
             {"speculative.p_min",         speculative.p_min},
+            {"speculative.type",          common_speculative_type_to_str(speculative.type)},
+            {"speculative.ngram_size_n",  speculative.ngram_size_n},
+            {"speculative.ngram_size_m",  speculative.ngram_size_m},
+            {"speculative.ngram_m_hits",  speculative.ngram_min_hits},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
@@ -135,6 +140,10 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.n_max",         speculative.n_max},
         {"speculative.n_min",         speculative.n_min},
         {"speculative.p_min",         speculative.p_min},
+        {"speculative.type",          common_speculative_type_to_str(speculative.type)},
+        {"speculative.ngram_size_n",  speculative.ngram_size_n},
+        {"speculative.ngram_size_m",  speculative.ngram_size_m},
+        {"speculative.ngram_m_hits",  speculative.ngram_min_hits},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
@@ -148,7 +157,8 @@ json task_params::to_json(bool only_metrics) const {
 common_chat_msg task_result_state::update_chat_msg(
         const std::string & text_added,
         bool is_partial,
-        std::vector<common_chat_msg_diff> & diffs) {
+        std::vector<common_chat_msg_diff> & diffs,
+        bool filter_tool_calls) {
     generated_text += text_added;
     auto msg_prv_copy = chat_msg;
     SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
@@ -159,7 +169,64 @@ common_chat_msg task_result_state::update_chat_msg(
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;
-        diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, new_msg.empty() ? msg_prv_copy : new_msg);
+        auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+
+        if (!filter_tool_calls) {
+            diffs = std::move(all_diffs);
+        } else {
+            for (auto & d : all_diffs) {
+                // If this is a new type of delta, flush all currently pending tool call names
+                for (size_t i = 0; i < chat_msg.tool_calls.size(); ++i) {
+                    if (sent_tool_call_names.count(i) || chat_msg.tool_calls[i].name.empty()) {
+                        continue;
+                    }
+                    if (d.tool_call_index != i || !d.tool_call_delta.arguments.empty()) {
+                        common_chat_msg_diff header;
+                        header.tool_call_index      = i;
+                        header.tool_call_delta.id   = chat_msg.tool_calls[i].id;
+                        header.tool_call_delta.name = chat_msg.tool_calls[i].name;
+                        diffs.push_back(std::move(header));
+                        sent_tool_call_names.insert(i);
+                    }
+                }
+
+                if (d.tool_call_index == std::string::npos) {
+                    diffs.push_back(std::move(d));
+                } else {
+                    size_t i = d.tool_call_index;
+                    if (sent_tool_call_names.count(i)) {
+                        if (!d.tool_call_delta.arguments.empty()) {
+                            d.tool_call_delta.name = "";
+                            d.tool_call_delta.id   = "";
+                            diffs.push_back(std::move(d));
+                        }
+                    } else {
+                        // Not sent yet.
+                        if (!d.tool_call_delta.arguments.empty() || !is_partial) {
+                            d.tool_call_delta.name = chat_msg.tool_calls[i].name;
+                            d.tool_call_delta.id   = chat_msg.tool_calls[i].id;
+                            diffs.push_back(std::move(d));
+                            sent_tool_call_names.insert(i);
+                        } else {
+                            // Suppress
+                        }
+                    }
+                }
+            }
+            // Final check at EOF
+            if (!is_partial) {
+                for (size_t i = 0; i < chat_msg.tool_calls.size(); ++i) {
+                    if (!sent_tool_call_names.count(i) && !chat_msg.tool_calls[i].name.empty()) {
+                        common_chat_msg_diff header;
+                        header.tool_call_index      = i;
+                        header.tool_call_delta.id   = chat_msg.tool_calls[i].id;
+                        header.tool_call_delta.name = chat_msg.tool_calls[i].name;
+                        diffs.push_back(std::move(header));
+                        sent_tool_call_names.insert(i);
+                    }
+                }
+            }
+        }
     }
     return chat_msg;
 }
@@ -195,7 +262,8 @@ task_params server_task::params_from_json_cmpl(
     params.cache_prompt     = json_value(data,       "cache_prompt",       defaults.cache_prompt);
     params.return_tokens    = json_value(data,       "return_tokens",      false);
     params.return_progress  = json_value(data,       "return_progress",    false);
-    params.n_predict        = json_value(data,       "n_predict",          json_value(data, "max_tokens", defaults.n_predict));
+    auto max_tokens         = json_value(data,       "max_tokens",         defaults.n_predict);
+    params.n_predict        = json_value(data,       "n_predict",          json_value(data, "max_completion_tokens", max_tokens));
     params.n_indent         = json_value(data,       "n_indent",           defaults.n_indent);
     params.n_keep           = json_value(data,       "n_keep",             defaults.n_keep);
     params.n_discard        = json_value(data,       "n_discard",          defaults.n_discard);
@@ -241,6 +309,16 @@ task_params server_task::params_from_json_cmpl(
     params.speculative.n_min = std::min(params.speculative.n_max, params.speculative.n_min);
     params.speculative.n_min = std::max(params.speculative.n_min, 0);
     params.speculative.n_max = std::max(params.speculative.n_max, 0);
+
+    params.speculative.type = common_speculative_type_from_name(json_value(data, "speculative.type", common_speculative_type_to_str(defaults.speculative.type)));
+
+    params.speculative.ngram_size_n     = json_value(data, "speculative.ngram_size_n", defaults.speculative.ngram_size_n);
+    params.speculative.ngram_size_m     = json_value(data, "speculative.ngram_size_m", defaults.speculative.ngram_size_m);
+    params.speculative.ngram_min_hits   = json_value(data, "speculative.ngram_m_hits", defaults.speculative.ngram_min_hits);
+
+    params.speculative.ngram_size_n     = std::max(std::min(1, (int) params.speculative.ngram_size_n),     1024);
+    params.speculative.ngram_size_m     = std::max(std::min(1, (int) params.speculative.ngram_size_m),     1024);
+    params.speculative.ngram_min_hits   = std::max(std::min(1, (int) params.speculative.ngram_min_hits),   1024);
 
     // Use OpenAI API logprobs only if n_probs wasn't provided
     if (data.contains("logprobs") && params.sampling.n_probs == defaults.sampling.n_probs){
@@ -381,6 +459,34 @@ task_params server_task::params_from_json_cmpl(
         }
         if (params.sampling.grammar_lazy && params.sampling.grammar_triggers.empty()) {
             throw std::runtime_error("Error: no triggers set for lazy grammar!");
+        }
+    }
+
+    // Parse reasoning budget sampler parameters
+    {
+        const int32_t budget = json_value(data, "reasoning_budget_tokens", (int32_t) -1);
+        if (budget >= 0) {
+            const auto start_tag = json_value(data, "reasoning_budget_start_tag", std::string());
+            const auto end_tag   = json_value(data, "reasoning_budget_end_tag", std::string());
+            const auto message   = json_value(data, "reasoning_budget_message", std::string());
+            const bool activate_imm   = json_value(data, "reasoning_budget_activate_immediately", false);
+
+            params.sampling.reasoning_budget_tokens = budget;
+            params.sampling.reasoning_budget_activate_immediately = activate_imm;
+
+            if (!start_tag.empty()) {
+                params.sampling.reasoning_budget_start = common_tokenize(vocab, start_tag, false, true);
+            }
+            if (!end_tag.empty()) {
+                params.sampling.reasoning_budget_end = common_tokenize(vocab, end_tag, false, true);
+                params.sampling.reasoning_budget_forced = common_tokenize(vocab, message + end_tag, false, true);
+            }
+
+            SRV_DBG("reasoning budget: tokens=%d, activate_immediately=%s, start=%zu toks, end=%zu toks, forced=%zu toks\n",
+                budget, activate_imm ? "true" : "false",
+                params.sampling.reasoning_budget_start.size(),
+                params.sampling.reasoning_budget_end.size(),
+                params.sampling.reasoning_budget_forced.size());
         }
     }
 
@@ -749,7 +855,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
             {"choices", json::array({
                 json {
                     {"finish_reason", nullptr},
-                    {"index", 0},
+                    {"index", index},
                     {"delta", common_chat_msg_diff_to_json_oaicompat(diff)},
                 },
             })},
@@ -765,7 +871,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         {"choices", json::array({
             json {
                 {"finish_reason", finish_reason},
-                {"index", 0},
+                {"index", index},
                 {"delta", json::object()},
             },
         })},
@@ -1880,10 +1986,9 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         return nullptr;
     }
 
-    // TODO: for some reason we can't copy server_tokens, so we have to do this workaround
     auto & cur = states.emplace_back();
     cur = {
-        /*.tokens      =*/ server_tokens(prompt.tokens.get_text_tokens(), false),
+        /*.tokens      =*/ prompt.tokens.clone(),
         /*.data        =*/ std::move(state_data),
         /*.checkpoints =*/ prompt.checkpoints,
     };
